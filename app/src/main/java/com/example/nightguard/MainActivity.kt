@@ -27,6 +27,27 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.PreviewScreenSizes
 import androidx.compose.ui.unit.dp
 import com.example.nightguard.ui.theme.NightGuardTheme
+import androidx.compose.ui.viewinterop.AndroidView
+import org.osmdroid.config.Configuration
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.FloatingActionButton
+import androidx.compose.runtime.*
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import org.osmdroid.events.MapEventsReceiver
+import org.osmdroid.views.overlay.MapEventsOverlay
+import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Polyline
+import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
+import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 
 // Data class dla Kontaktu (na potrzeby edycji w pamięci)
 data class TrustedContact(val id: Int, val name: String, val phone: String)
@@ -172,16 +193,116 @@ fun TrustedContactItem(name: String, phone: String) {
 // --- EKRAN MAPY (Placeholder) ---
 @Composable
 fun MapScreen() {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.secondaryContainer),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Icon(Icons.Default.LocationOn, contentDescription = null, modifier = Modifier.size(48.dp))
-            Text("Mapa Google", style = MaterialTheme.typography.headlineMedium)
-            Text("Tu w przyszłości będzie widok nawigacji", style = MaterialTheme.typography.bodyMedium)
+    val context = LocalContext.current
+
+    // Stan mapy i kontrolera (do centrowania)
+    var mapView by remember { mutableStateOf<MapView?>(null) }
+    var locationOverlay by remember { mutableStateOf<MyLocationNewOverlay?>(null) }
+
+    // Launcher do zapytania o uprawnienia
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val isGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        if (isGranted) {
+            // Jeśli przyznano uprawnienia, włączamy śledzenie
+            locationOverlay?.enableMyLocation()
+            locationOverlay?.enableFollowLocation()
+        }
+    }
+
+    // Sprawdzenie uprawnień przy starcie
+    LaunchedEffect(Unit) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            permissionLauncher.launch(arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            ))
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        AndroidView(
+            factory = { ctx ->
+                Configuration.getInstance().userAgentValue = ctx.packageName
+
+                MapView(ctx).apply {
+                    setTileSource(TileSourceFactory.MAPNIK)
+                    setMultiTouchControls(true)
+                    controller.setZoom(18.0)
+
+                    // 1. Konfiguracja warstwy lokalizacji
+                    // Używamy domyślnego dostawcy (automatycznie wybierze GPS lub Network)
+                    val provider = GpsMyLocationProvider(ctx)
+
+                    val overlay = MyLocationNewOverlay(provider, this)
+                    overlay.enableMyLocation()
+                    overlay.enableFollowLocation()
+                    overlay.isDrawAccuracyEnabled = true
+
+                    // Dodajemy warstwę lokalizacji do mapy
+                    overlays.add(overlay)
+                    locationOverlay = overlay
+
+                    // Wstępne wycentrowanie (Polska)
+                    controller.setCenter(GeoPoint(52.0, 19.0))
+
+                    // 2. Obsługa kliknięć (Wyznaczanie celu)
+                    val mapEventsReceiver = object : MapEventsReceiver {
+                        override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {
+                            p?.let { targetPoint ->
+                                // Usuwamy stare trasy i markery (zachowując MyLocationOverlay i MapEventsOverlay)
+                                overlays.removeAll { it !is MyLocationNewOverlay && it !is MapEventsOverlay }
+
+                                // Dodajemy Marker Celu
+                                val marker = Marker(this@apply)
+                                marker.position = targetPoint
+                                marker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                                marker.title = "Cel podróży"
+                                overlays.add(marker)
+
+                                // Rysujemy linię (trasę) od użytkownika do celu
+                                val myLoc = overlay.myLocation
+                                if (myLoc != null) {
+                                    val line = Polyline()
+                                    line.addPoint(myLoc)
+                                    line.addPoint(targetPoint)
+                                    // Kolor linii (niebieski ARGB)
+                                    line.color = android.graphics.Color.BLUE
+                                    line.width = 10f
+                                    overlays.add(line)
+                                }
+                                invalidate() // Odśwież mapę
+                            }
+                            return true
+                        }
+
+                        override fun longPressHelper(p: GeoPoint?): Boolean = false
+                    }
+                    overlays.add(MapEventsOverlay(mapEventsReceiver))
+
+                    mapView = this
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // Przycisk "Moja Lokalizacja" (FAB)
+        FloatingActionButton(
+            onClick = {
+                locationOverlay?.enableFollowLocation()
+                val myLoc = locationOverlay?.myLocation
+                if (myLoc != null) {
+                    mapView?.controller?.animateTo(myLoc)
+                }
+            },
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(16.dp)
+        ) {
+            // Zmieniono ikonę na LocationOn (standardowa pinezka), bo NearMe wymaga dodatkowej biblioteki
+            Icon(Icons.Default.LocationOn, contentDescription = "Wyśrodkuj")
         }
     }
 }
