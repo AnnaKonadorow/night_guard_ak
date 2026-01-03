@@ -57,6 +57,8 @@ import kotlinx.coroutines.withContext
 import org.osmdroid.bonuspack.location.NominatimPOIProvider
 import org.osmdroid.bonuspack.location.GeocoderNominatim
 import kotlinx.coroutines.delay
+import android.content.Context
+import android.location.LocationManager
 
 // Data class dla Kontaktu (na potrzeby edycji w pamięci)
 data class TrustedContact(val id: Int, val name: String, val phone: String)
@@ -315,155 +317,120 @@ fun TrustedContactItem(name: String, phone: String) {
 @Composable
 fun MapScreen() {
     val context = LocalContext.current
+
+    // Stan uprawnień - kluczowy po wyczyszczeniu danych
+    var hasLocationPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+
     var mapView by remember { mutableStateOf<MapView?>(null) }
     var locationOverlay by remember { mutableStateOf<MyLocationNewOverlay?>(null) }
-
     var searchQuery by remember { mutableStateOf("") }
     var suggestions by remember { mutableStateOf<List<android.location.Address>>(emptyList()) }
 
-    // ... (Zachowaj kod od uprawnień i LaunchedEffect) ...
+    // 1. Launcher uprawnień - reaguje natychmiast na "Zezwól"
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val granted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        hasLocationPermission = granted
+    }
 
+    // 2. Obsługa cyklu życia mapy (wymagane przez osmdroid)
+    DisposableEffect(mapView) {
+        mapView?.onResume()
+        onDispose {
+            mapView?.onPause()
+        }
+    }
+
+    // 3. Reakcja na zmianę uprawnień (np. zaraz po kliknięciu "Zezwól")
+    LaunchedEffect(hasLocationPermission) {
+        if (hasLocationPermission) {
+            locationOverlay?.enableMyLocation()
+            locationOverlay?.enableFollowLocation()
+            mapView?.invalidate()
+        } else {
+            permissionLauncher.launch(arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            ))
+        }
+    }
+
+    // GŁÓWNY KONTENER
     Box(modifier = Modifier.fillMaxSize()) {
-        // 1. MAPA
+
+        // WARSTWA 1: MAPA
         AndroidView(
             factory = { ctx ->
+                // Załadowanie konfiguracji po czyszczeniu danych
+                Configuration.getInstance().load(ctx, ctx.getSharedPreferences("osmdroid", Context.MODE_PRIVATE))
+
                 MapView(ctx).apply {
                     setTileSource(TileSourceFactory.MAPNIK)
                     setMultiTouchControls(true)
+                    controller.setZoom(15.0)
 
-                    // Konfiguracja dostawcy i warstwy
-                    val provider = GpsMyLocationProvider(ctx)
-                    provider.addLocationSource(android.location.LocationManager.GPS_PROVIDER)
-                    provider.addLocationSource(android.location.LocationManager.NETWORK_PROVIDER)
+                    val provider = GpsMyLocationProvider(ctx).apply {
+                        addLocationSource(LocationManager.GPS_PROVIDER)
+                        addLocationSource(LocationManager.NETWORK_PROVIDER)
+                    }
 
                     val overlay = MyLocationNewOverlay(provider, this)
-                    overlay.enableMyLocation() // Włącza pobieranie pozycji
-                    overlay.enableFollowLocation() // Automatycznie centruje na start
-                    overlay.isDrawAccuracyEnabled = true
+                    // Jeśli mamy uprawnienia już teraz, włączamy
+                    if (hasLocationPermission) {
+                        overlay.enableMyLocation()
+                    }
 
                     overlays.add(overlay)
                     locationOverlay = overlay
                     mapView = this
 
-                    controller.setZoom(15.0)
+                    // (Tutaj zachowaj swój kod MapEventsOverlay dla pinezki)
                 }
             },
-            modifier = Modifier.fillMaxSize(),
-            update = { mv ->
-                // Tutaj można aktualizować stan mapy, jeśli jest taka potrzeba
-            }
+            modifier = Modifier.fillMaxSize()
         )
 
-        // KLUCZOWE: Obsługa cyklu życia dla GPS
-        DisposableEffect(Unit) {
-            onDispose {
-                mapView?.onPause()
-                locationOverlay?.disableMyLocation()
-            }
-        }
-
-        // Wymuszenie startu w LaunchedEffect
-        LaunchedEffect(searchQuery) {
-            if (searchQuery.length > 3) {
-                delay(600)
-                val geocoder = GeocoderNominatim("NightGuard/1.0")
-                // Opcjonalnie: geocoder.setOptions(true) // jeśli chcesz więcej szczegółów
-
-                try {
-                    val results = withContext(Dispatchers.IO) {
-                        // Szukamy do 10 wyników, aby mieć większy wybór miejscowości
-                        geocoder.getFromLocationName(searchQuery, 10)
-                    }
-                    suggestions = results ?: emptyList()
-                } catch (e: Exception) {
-                    suggestions = emptyList()
-                }
-            } else {
-                suggestions = emptyList()
-            }
-        }
-        // 2. PANEL WYSZUKIWANIA
+        // WARSTWA 2: WYSZUKIWARKA (Na górze)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp)
-                .align(Alignment.TopCenter)
+                .padding(top = 40.dp, start = 16.dp, end = 16.dp)
         ) {
-            Card(elevation = CardDefaults.cardElevation(8.dp)) {
-                TextField(
-                    value = searchQuery,
-                    onValueChange = {
-                        searchQuery = it
-                        // Pobieraj podpowiedzi w miarę pisania
-                        fetchAddressSuggestions(it) { results ->
-                            suggestions = results
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    placeholder = { Text("Dokąd idziemy?") },
-                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
-                    trailingIcon = {
-                        if (searchQuery.isNotEmpty()) {
-                            IconButton(onClick = {
-                                searchQuery = ""
-                                suggestions = emptyList()
-                            }) {
-                                Icon(Icons.Default.Clear, contentDescription = null)
-                            }
-                        }
-                    },
-                    colors = TextFieldDefaults.colors(
-                        focusedIndicatorColor = Color.Transparent,
-                        unfocusedIndicatorColor = Color.Transparent
-                    )
-                )
-            }
-
-            // LISTA PODPOWIEDZI (Pojawia się tylko gdy są wyniki)
-            if (suggestions.isNotEmpty()) {
-                Card(
-                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                    elevation = CardDefaults.cardElevation(4.dp)
-                ) {
-                    LazyColumn(modifier = Modifier.heightIn(max = 200.dp)) {
-                        items(suggestions) { address ->
-                            // Konstruujemy czytelniejszy opis: Ulica Numer, Miasto
-                            val street = address.thoroughfare ?: ""
-                            val houseNumber = address.featureName ?: ""
-                            val city = address.locality ?: address.adminArea ?: ""
-                            val fullLabel = if (street.isNotEmpty()) {
-                                "$street $houseNumber, $city".trim().trim(',')
-                            } else {
-                                address.getAddressLine(0) // fallback
-                            }
-
-                            ListItem(
-                                headlineContent = { Text(fullLabel) },
-                                supportingContent = {
-                                    // Dodatkowy opis (np. województwo/kraj), aby uniknąć duplikatów
-                                    Text(address.adminArea ?: address.countryName ?: "")
-                                },
-                                modifier = Modifier.clickable {
-                                    val target = GeoPoint(address.latitude, address.longitude)
-                                    mapView?.let { mv ->
-                                        mv.controller.animateTo(target)
-                                        setDestinationAndRoute(target, mv, locationOverlay, context)
-                                    }
-                                    searchQuery = fullLabel
-                                    suggestions = emptyList()
-                                }
-                            )
-                            HorizontalDivider()
-                        }
-                    }
-                }
-            }
+            // Tutaj Twój obecny kod OutlinedTextField i Listy podpowiedzi
+            // ... (zachowaj go bez zmian)
         }
 
-        // ... (Zachowaj FloatingActionButton na dole) ...
+        // WARSTWA 3: PRZYCISK LOKALIZACJI (FAB)
+        // Musi być w Box, ale POZE Column, aby nie uciekał na dół
+        FloatingActionButton(
+            onClick = {
+                if (hasLocationPermission) {
+                    locationOverlay?.let {
+                        it.enableFollowLocation()
+                        val myLoc = it.myLocation
+                        if (myLoc != null) {
+                            mapView?.controller?.animateTo(myLoc)
+                        }
+                    }
+                } else {
+                    permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
+                }
+            },
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(bottom = 32.dp, end = 16.dp),
+            containerColor = MaterialTheme.colorScheme.primary
+        ) {
+            Icon(Icons.Default.LocationOn, contentDescription = "Lokalizacja")
+        }
     }
 }
-
 // Pomocnicza funkcja do ustawiania celu i rysowania trasy
 private fun setDestinationAndRoute(
     target: GeoPoint,
