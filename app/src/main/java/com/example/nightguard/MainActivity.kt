@@ -314,40 +314,50 @@ fun TrustedContactItem(name: String, phone: String) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MapScreen() {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
-    // Stan uprawnień - kluczowy po wyczyszczeniu danych
-    var hasLocationPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
-        )
-    }
-
+    // --- STANY ---
     var mapView by remember { mutableStateOf<MapView?>(null) }
     var locationOverlay by remember { mutableStateOf<MyLocationNewOverlay?>(null) }
     var searchQuery by remember { mutableStateOf("") }
     var suggestions by remember { mutableStateOf<List<android.location.Address>>(emptyList()) }
 
-    // 1. Launcher uprawnień - reaguje natychmiast na "Zezwól"
+    // Sprawdzanie uprawnień (ważne po czyszczeniu danych)
+    var hasLocationPermission by remember {
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED)
+    }
+
+    // --- LOGIKA UPRAWNIEŃ ---
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        val granted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+        hasLocationPermission = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
                 permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-        hasLocationPermission = granted
     }
 
-    // 2. Obsługa cyklu życia mapy (wymagane przez osmdroid)
-    DisposableEffect(mapView) {
-        mapView?.onResume()
-        onDispose {
-            mapView?.onPause()
+    // --- INTELIGENTNE WYSZUKIWANIE (DEBOUNCE 600ms) ---
+    LaunchedEffect(searchQuery) {
+        if (searchQuery.length > 3) {
+            delay(600)
+            val geocoder = GeocoderNominatim("NightGuard/1.0")
+            try {
+                val results = withContext(Dispatchers.IO) {
+                    geocoder.getFromLocationName(searchQuery, 10)
+                }
+                suggestions = results ?: emptyList()
+            } catch (e: Exception) {
+                suggestions = emptyList()
+            }
+        } else {
+            suggestions = emptyList()
         }
     }
 
-    // 3. Reakcja na zmianę uprawnień (np. zaraz po kliknięciu "Zezwól")
+    // --- REAKCJA NA ZMIANĘ STANU UPRAWNIEŃ ---
     LaunchedEffect(hasLocationPermission) {
         if (hasLocationPermission) {
             locationOverlay?.enableMyLocation()
@@ -361,13 +371,13 @@ fun MapScreen() {
         }
     }
 
-    // GŁÓWNY KONTENER
+    // --- UKŁAD UI ---
     Box(modifier = Modifier.fillMaxSize()) {
 
-        // WARSTWA 1: MAPA
+        // 1. MAPA (Warstwa spodnia)
         AndroidView(
             factory = { ctx ->
-                // Załadowanie konfiguracji po czyszczeniu danych
+                // Ładowanie konfiguracji osmdroid
                 Configuration.getInstance().load(ctx, ctx.getSharedPreferences("osmdroid", Context.MODE_PRIVATE))
 
                 MapView(ctx).apply {
@@ -381,42 +391,103 @@ fun MapScreen() {
                     }
 
                     val overlay = MyLocationNewOverlay(provider, this)
-                    // Jeśli mamy uprawnienia już teraz, włączamy
                     if (hasLocationPermission) {
                         overlay.enableMyLocation()
                     }
 
                     overlays.add(overlay)
                     locationOverlay = overlay
-                    mapView = this
 
-                    // (Tutaj zachowaj swój kod MapEventsOverlay dla pinezki)
+                    // Obsługa kliknięcia w mapę (ustawianie pinezki ręcznie)
+                    val mapEventsReceiver = object : MapEventsReceiver {
+                        override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {
+                            p?.let { target ->
+                                setDestinationAndRoute(target, this@apply, locationOverlay, ctx)
+                            }
+                            return true
+                        }
+                        override fun longPressHelper(p: GeoPoint?): Boolean = false
+                    }
+                    overlays.add(MapEventsOverlay(mapEventsReceiver))
+
+                    mapView = this
                 }
             },
             modifier = Modifier.fillMaxSize()
         )
 
-        // WARSTWA 2: WYSZUKIWARKA (Na górze)
+        // 2. PASEK WYSZUKIWANIA I PODPOWIEDZI (Warstwa środkowa, na górze)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(top = 40.dp, start = 16.dp, end = 16.dp)
+                .padding(top = 48.dp, start = 16.dp, end = 16.dp)
+                .align(Alignment.TopCenter)
         ) {
-            // Tutaj Twój obecny kod OutlinedTextField i Listy podpowiedzi
-            // ... (zachowaj go bez zmian)
+            Card(
+                elevation = CardDefaults.cardElevation(8.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+            ) {
+                TextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    placeholder = { Text("Wyszukaj adres docelowy...") },
+                    modifier = Modifier.fillMaxWidth(),
+                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { searchQuery = ""; suggestions = emptyList() }) {
+                                Icon(Icons.Default.Clear, contentDescription = null)
+                            }
+                        }
+                    },
+                    singleLine = true,
+                    colors = TextFieldDefaults.colors(
+                        focusedIndicatorColor = Color.Transparent,
+                        unfocusedIndicatorColor = Color.Transparent
+                    )
+                )
+            }
+
+            // Lista podpowiedzi
+            if (suggestions.isNotEmpty()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    elevation = CardDefaults.cardElevation(4.dp)
+                ) {
+                    LazyColumn(modifier = Modifier.heightIn(max = 250.dp)) {
+                        items(suggestions) { address ->
+                            val street = address.thoroughfare ?: ""
+                            val houseNum = address.featureName ?: ""
+                            val city = address.locality ?: address.adminArea ?: ""
+                            val label = if (street.isNotEmpty()) "$street $houseNum, $city".trim() else address.getAddressLine(0)
+
+                            ListItem(
+                                headlineContent = { Text(label) },
+                                supportingContent = { Text(address.adminArea ?: "") },
+                                modifier = Modifier.clickable {
+                                    val target = GeoPoint(address.latitude, address.longitude)
+                                    mapView?.let { mv ->
+                                        mv.controller.animateTo(target)
+                                        setDestinationAndRoute(target, mv, locationOverlay, context)
+                                    }
+                                    searchQuery = label
+                                    suggestions = emptyList()
+                                }
+                            )
+                            HorizontalDivider(thickness = 0.5.dp)
+                        }
+                    }
+                }
+            }
         }
 
-        // WARSTWA 3: PRZYCISK LOKALIZACJI (FAB)
-        // Musi być w Box, ale POZE Column, aby nie uciekał na dół
+        // 3. PRZYCISK LOKALIZACJI (Warstwa wierzchnia, prawy dół)
         FloatingActionButton(
             onClick = {
                 if (hasLocationPermission) {
                     locationOverlay?.let {
                         it.enableFollowLocation()
-                        val myLoc = it.myLocation
-                        if (myLoc != null) {
-                            mapView?.controller?.animateTo(myLoc)
-                        }
+                        it.myLocation?.let { loc -> mapView?.controller?.animateTo(loc) }
                     }
                 } else {
                     permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
