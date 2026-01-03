@@ -18,6 +18,15 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        // Dodaj tę linię:
+        maven { url = uri("https://jitpack.io") }
+    }
+}
 
 rootProject.name = "Night Guard"
 include(":app")

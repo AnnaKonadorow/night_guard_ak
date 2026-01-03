@@ -60,4 +60,9 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     implementation("org.osmdroid:osmdroid-android:6.1.18")
     implementation("com.google.android.gms:play-services-location:21.0.1")
+    implementation("com.github.MKergall:osmbonuspack:6.9.0")
+    // DataStore do zapisywania ustawień
+    implementation("androidx.datastore:datastore-preferences:1.1.1")
+    // Gson do zamiany listy kontaktów na tekst
+    implementation("com.google.code.gson:gson:2.10.1")
 }

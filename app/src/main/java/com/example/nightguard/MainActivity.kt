@@ -48,6 +48,15 @@ import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
 import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
 import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
+import org.osmdroid.bonuspack.routing.OSRMRoadManager
+import org.osmdroid.bonuspack.routing.RoadManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.osmdroid.bonuspack.location.NominatimPOIProvider
+import org.osmdroid.bonuspack.location.GeocoderNominatim
+import kotlinx.coroutines.delay
 
 // Data class dla Kontaktu (na potrzeby edycji w pamięci)
 data class TrustedContact(val id: Int, val name: String, val phone: String)
@@ -56,33 +65,71 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        setContent {
-            // Zarządzanie motywem na poziomie całej aplikacji
-            var isDarkTheme by rememberSaveable { mutableStateOf(false) } // Domyślnie light, lub zmień na isSystemInDarkTheme()
 
-            NightGuardTheme(darkTheme = isDarkTheme) {
+        // Inicjalizacja magazynu danych (poza setContent jest OK)
+        val storage = DataStorage(applicationContext)
+
+        Configuration.getInstance().userAgentValue = "NightGuard/1.0"
+
+        setContent {
+            // --- TUTAJ ZACZYNA SIĘ KONTEKST COMPOSABLE ---
+
+            // 1. Sprawdź ustawienie systemowe (UE)
+            val systemInDarkTheme = isSystemInDarkTheme()
+
+            // 2. Pobierz zapisany wybór użytkownika (0: System, 1: Light, 2: Dark)
+            val savedThemeMode by storage.themeFlow.collectAsState(initial = 0)
+
+            // 3. Oblicz finalny motyw
+            val darkTheme = when (savedThemeMode) {
+                1 -> false
+                2 -> true
+                else -> systemInDarkTheme // Jeśli 0, to dostosuj do UE
+            }
+
+            NightGuardTheme(darkTheme = darkTheme) {
                 NightGuardApp(
-                    isDarkTheme = isDarkTheme,
-                    onThemeChanged = { isDarkTheme = it }
+                    storage = storage,
+                    isDarkTheme = darkTheme,
+                    onThemeChanged = { isDark ->
+                        // Zapisujemy wybór na stałe (Coroutine)
+                        GlobalScope.launch {
+                            storage.saveTheme(if (isDark) 2 else 1)
+                        }
+                    }
                 )
             }
         }
     }
 }
 
-@PreviewScreenSizes
 @Composable
 fun NightGuardApp(
-    isDarkTheme: Boolean = false,
-    onThemeChanged: (Boolean) -> Unit = {}
+    storage: DataStorage,
+    isDarkTheme: Boolean,
+    onThemeChanged: (Boolean) -> Unit
 ) {
     var currentDestination by rememberSaveable { mutableStateOf(AppDestinations.HOME) }
+    val scope = rememberCoroutineScope()
 
-    // Wspólna lista kontaktów (stan wyniesiony wyżej, by był dostępny w Home i w Profile)
-    val trustedContacts = remember { mutableStateListOf(
-        TrustedContact(1, "Mama", "123-456-789"),
-        TrustedContact(2, "Krzysztof", "987-654-321")
-    )}
+    // Ładowanie kontaktów z DataStore
+    val savedContacts by storage.contactsFlow.collectAsState(initial = emptyList())
+
+    // Lista robocza w pamięci
+    val trustedContacts = remember { mutableStateListOf<TrustedContact>() }
+
+    // Synchronizacja: gdy dane z pamięci (savedContacts) się zmienią, aktualizuj listę w UI
+    LaunchedEffect(savedContacts) {
+        trustedContacts.clear()
+        trustedContacts.addAll(savedContacts)
+    }
+
+    // Funkcja do trwałego zapisu listy
+    val syncContacts = {
+        scope.launch {
+            storage.saveContacts(trustedContacts.toList())
+        }
+    }
 
     NavigationSuiteScaffold(
         navigationSuiteItems = {
@@ -106,9 +153,84 @@ fun NightGuardApp(
                 isDarkTheme = isDarkTheme,
                 onThemeChanged = onThemeChanged,
                 contacts = trustedContacts,
-                onContactListChanged = { /* Lista jest mutowalna, zmiany dzieją się "w miejscu", ale tu można dodać logikę zapisu do bazy */ }
+                onContactListChanged = { syncContacts() } // Zapisuj przy każdej zmianie
             )
         }
+    }
+}
+
+fun traceRoute(
+    context: android.content.Context,
+    mapView: MapView,
+    startPoint: GeoPoint,
+    destinationPoint: GeoPoint
+) {
+    // Zmieniamy typ na OSRMRoadManager, aby odblokować funkcje specyficzne dla OSRM
+    val roadManager = OSRMRoadManager(context, "NightGuard/1.0")
+
+    // Ustawienie profilu pieszego poprzez zmianę URL serwisu
+    //roadManager.setService("https://router.project-osrm.org/route/v1/walking/")
+
+    GlobalScope.launch(Dispatchers.IO) {
+        val waypoints = arrayListOf(startPoint, destinationPoint)
+        try {
+            val road = roadManager.getRoad(waypoints)
+            val roadOverlay = RoadManager.buildRoadOverlay(road)
+
+            withContext(Dispatchers.Main) {
+                mapView.overlays.removeAll { it is Polyline }
+                mapView.overlays.add(roadOverlay)
+                mapView.invalidate()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+}
+
+// Poprawiona funkcja wyszukiwania adresu (findAddress)
+fun findAddress(
+    addressString: String,
+    mapView: MapView,
+    onLocationFound: (GeoPoint) -> Unit
+) {
+    val geocoder = GeocoderNominatim("NightGuard/1.0")
+
+    GlobalScope.launch(Dispatchers.IO) {
+        try {
+            // Jawne określenie typu dla listy wyników
+            val addresses = geocoder.getFromLocationName(addressString, 1)
+            if (!addresses.isNullOrEmpty()) {
+                val address = addresses[0]
+                val targetPoint = GeoPoint(address.latitude, address.longitude)
+
+                withContext(Dispatchers.Main) {
+                    // Przesunięcie kamery do celu
+                    mapView.controller.animateTo(targetPoint)
+                    // Wywołanie callbacka, który ustawi pinezkę i trasę
+                    onLocationFound(targetPoint)
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+}
+fun fetchAddressSuggestions(
+    query: String,
+    onResult: (List<android.location.Address>) -> Unit
+) {
+    if (query.length < 3) return // Nie szukaj dla zbyt krótkich fraz
+
+    val geocoder = GeocoderNominatim("NightGuard/1.0")
+    GlobalScope.launch(Dispatchers.IO) {
+        try {
+            // Pobieramy do 5 propozycji
+            val results = geocoder.getFromLocationName(query, 5)
+            withContext(Dispatchers.Main) {
+                onResult(results ?: emptyList())
+            }
+        } catch (e: Exception) { e.printStackTrace() }
     }
 }
 
@@ -190,121 +312,180 @@ fun TrustedContactItem(name: String, phone: String) {
     }
 }
 
-// --- EKRAN MAPY (Placeholder) ---
 @Composable
 fun MapScreen() {
     val context = LocalContext.current
-
-    // Stan mapy i kontrolera (do centrowania)
     var mapView by remember { mutableStateOf<MapView?>(null) }
     var locationOverlay by remember { mutableStateOf<MyLocationNewOverlay?>(null) }
 
-    // Launcher do zapytania o uprawnienia
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        val isGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-                permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-        if (isGranted) {
-            // Jeśli przyznano uprawnienia, włączamy śledzenie
-            locationOverlay?.enableMyLocation()
-            locationOverlay?.enableFollowLocation()
-        }
-    }
+    var searchQuery by remember { mutableStateOf("") }
+    var suggestions by remember { mutableStateOf<List<android.location.Address>>(emptyList()) }
 
-    // Sprawdzenie uprawnień przy starcie
-    LaunchedEffect(Unit) {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            permissionLauncher.launch(arrayOf(
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION
-            ))
-        }
-    }
+    // ... (Zachowaj kod od uprawnień i LaunchedEffect) ...
 
     Box(modifier = Modifier.fillMaxSize()) {
+        // 1. MAPA
         AndroidView(
             factory = { ctx ->
-                Configuration.getInstance().userAgentValue = ctx.packageName
-
                 MapView(ctx).apply {
                     setTileSource(TileSourceFactory.MAPNIK)
                     setMultiTouchControls(true)
-                    controller.setZoom(18.0)
 
-                    // 1. Konfiguracja warstwy lokalizacji
-                    // Używamy domyślnego dostawcy (automatycznie wybierze GPS lub Network)
+                    // Konfiguracja dostawcy i warstwy
                     val provider = GpsMyLocationProvider(ctx)
+                    provider.addLocationSource(android.location.LocationManager.GPS_PROVIDER)
+                    provider.addLocationSource(android.location.LocationManager.NETWORK_PROVIDER)
 
                     val overlay = MyLocationNewOverlay(provider, this)
-                    overlay.enableMyLocation()
-                    overlay.enableFollowLocation()
+                    overlay.enableMyLocation() // Włącza pobieranie pozycji
+                    overlay.enableFollowLocation() // Automatycznie centruje na start
                     overlay.isDrawAccuracyEnabled = true
 
-                    // Dodajemy warstwę lokalizacji do mapy
                     overlays.add(overlay)
                     locationOverlay = overlay
-
-                    // Wstępne wycentrowanie (Polska)
-                    controller.setCenter(GeoPoint(52.0, 19.0))
-
-                    // 2. Obsługa kliknięć (Wyznaczanie celu)
-                    val mapEventsReceiver = object : MapEventsReceiver {
-                        override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {
-                            p?.let { targetPoint ->
-                                // Usuwamy stare trasy i markery (zachowując MyLocationOverlay i MapEventsOverlay)
-                                overlays.removeAll { it !is MyLocationNewOverlay && it !is MapEventsOverlay }
-
-                                // Dodajemy Marker Celu
-                                val marker = Marker(this@apply)
-                                marker.position = targetPoint
-                                marker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-                                marker.title = "Cel podróży"
-                                overlays.add(marker)
-
-                                // Rysujemy linię (trasę) od użytkownika do celu
-                                val myLoc = overlay.myLocation
-                                if (myLoc != null) {
-                                    val line = Polyline()
-                                    line.addPoint(myLoc)
-                                    line.addPoint(targetPoint)
-                                    // Kolor linii (niebieski ARGB)
-                                    line.color = android.graphics.Color.BLUE
-                                    line.width = 10f
-                                    overlays.add(line)
-                                }
-                                invalidate() // Odśwież mapę
-                            }
-                            return true
-                        }
-
-                        override fun longPressHelper(p: GeoPoint?): Boolean = false
-                    }
-                    overlays.add(MapEventsOverlay(mapEventsReceiver))
-
                     mapView = this
+
+                    controller.setZoom(15.0)
                 }
             },
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier.fillMaxSize(),
+            update = { mv ->
+                // Tutaj można aktualizować stan mapy, jeśli jest taka potrzeba
+            }
         )
 
-        // Przycisk "Moja Lokalizacja" (FAB)
-        FloatingActionButton(
-            onClick = {
-                locationOverlay?.enableFollowLocation()
-                val myLoc = locationOverlay?.myLocation
-                if (myLoc != null) {
-                    mapView?.controller?.animateTo(myLoc)
-                }
-            },
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(16.dp)
-        ) {
-            // Zmieniono ikonę na LocationOn (standardowa pinezka), bo NearMe wymaga dodatkowej biblioteki
-            Icon(Icons.Default.LocationOn, contentDescription = "Wyśrodkuj")
+        // KLUCZOWE: Obsługa cyklu życia dla GPS
+        DisposableEffect(Unit) {
+            onDispose {
+                mapView?.onPause()
+                locationOverlay?.disableMyLocation()
+            }
         }
+
+        // Wymuszenie startu w LaunchedEffect
+        LaunchedEffect(searchQuery) {
+            if (searchQuery.length > 3) {
+                delay(600)
+                val geocoder = GeocoderNominatim("NightGuard/1.0")
+                // Opcjonalnie: geocoder.setOptions(true) // jeśli chcesz więcej szczegółów
+
+                try {
+                    val results = withContext(Dispatchers.IO) {
+                        // Szukamy do 10 wyników, aby mieć większy wybór miejscowości
+                        geocoder.getFromLocationName(searchQuery, 10)
+                    }
+                    suggestions = results ?: emptyList()
+                } catch (e: Exception) {
+                    suggestions = emptyList()
+                }
+            } else {
+                suggestions = emptyList()
+            }
+        }
+        // 2. PANEL WYSZUKIWANIA
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+                .align(Alignment.TopCenter)
+        ) {
+            Card(elevation = CardDefaults.cardElevation(8.dp)) {
+                TextField(
+                    value = searchQuery,
+                    onValueChange = {
+                        searchQuery = it
+                        // Pobieraj podpowiedzi w miarę pisania
+                        fetchAddressSuggestions(it) { results ->
+                            suggestions = results
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = { Text("Dokąd idziemy?") },
+                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = {
+                                searchQuery = ""
+                                suggestions = emptyList()
+                            }) {
+                                Icon(Icons.Default.Clear, contentDescription = null)
+                            }
+                        }
+                    },
+                    colors = TextFieldDefaults.colors(
+                        focusedIndicatorColor = Color.Transparent,
+                        unfocusedIndicatorColor = Color.Transparent
+                    )
+                )
+            }
+
+            // LISTA PODPOWIEDZI (Pojawia się tylko gdy są wyniki)
+            if (suggestions.isNotEmpty()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    elevation = CardDefaults.cardElevation(4.dp)
+                ) {
+                    LazyColumn(modifier = Modifier.heightIn(max = 200.dp)) {
+                        items(suggestions) { address ->
+                            // Konstruujemy czytelniejszy opis: Ulica Numer, Miasto
+                            val street = address.thoroughfare ?: ""
+                            val houseNumber = address.featureName ?: ""
+                            val city = address.locality ?: address.adminArea ?: ""
+                            val fullLabel = if (street.isNotEmpty()) {
+                                "$street $houseNumber, $city".trim().trim(',')
+                            } else {
+                                address.getAddressLine(0) // fallback
+                            }
+
+                            ListItem(
+                                headlineContent = { Text(fullLabel) },
+                                supportingContent = {
+                                    // Dodatkowy opis (np. województwo/kraj), aby uniknąć duplikatów
+                                    Text(address.adminArea ?: address.countryName ?: "")
+                                },
+                                modifier = Modifier.clickable {
+                                    val target = GeoPoint(address.latitude, address.longitude)
+                                    mapView?.let { mv ->
+                                        mv.controller.animateTo(target)
+                                        setDestinationAndRoute(target, mv, locationOverlay, context)
+                                    }
+                                    searchQuery = fullLabel
+                                    suggestions = emptyList()
+                                }
+                            )
+                            HorizontalDivider()
+                        }
+                    }
+                }
+            }
+        }
+
+        // ... (Zachowaj FloatingActionButton na dole) ...
     }
+}
+
+// Pomocnicza funkcja do ustawiania celu i rysowania trasy
+private fun setDestinationAndRoute(
+    target: GeoPoint,
+    mapView: MapView,
+    locationOverlay: MyLocationNewOverlay?,
+    context: android.content.Context
+) {
+    // Usuń stare markery i trasy
+    mapView.overlays.removeAll { it is Marker || it is Polyline }
+
+    // Dodaj pinezkę
+    val marker = Marker(mapView)
+    marker.position = target
+    marker.title = "Cel"
+    mapView.overlays.add(marker)
+
+    // Wyznacz trasę po drogach
+    val currentLoc = locationOverlay?.myLocation
+    if (currentLoc != null) {
+        traceRoute(context, mapView, currentLoc, target)
+    }
+    mapView.invalidate()
 }
 
 // --- EKRAN PROFILU I USTAWIEŃ ---
@@ -318,11 +499,10 @@ fun ProfileScreen(
     isDarkTheme: Boolean,
     onThemeChanged: (Boolean) -> Unit,
     contacts: MutableList<TrustedContact>,
-    onContactListChanged: () -> Unit
+    onContactListChanged: () -> Unit // Dodajemy ten parametr
 ) {
     var currentView by remember { mutableStateOf(ProfileView.MAIN) }
 
-    // Prosta nawigacja wewnętrzna
     when (currentView) {
         ProfileView.MAIN -> {
             ProfileMainView(
@@ -334,7 +514,8 @@ fun ProfileScreen(
         ProfileView.EDIT_CONTACTS -> {
             ContactsEditorView(
                 contacts = contacts,
-                onBack = { currentView = ProfileView.MAIN }
+                onBack = { currentView = ProfileView.MAIN },
+                onContactListChanged = onContactListChanged // Przekazujemy dalej
             )
         }
     }
@@ -423,25 +604,22 @@ fun ProfileMainView(
 @Composable
 fun ContactsEditorView(
     contacts: MutableList<TrustedContact>,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onContactListChanged: () -> Unit // Nowy parametr
 ) {
-    // Stan dla pól formularza (dodawanie nowego)
     var newName by remember { mutableStateOf("") }
     var newPhone by remember { mutableStateOf("") }
-
-    // Stan przechowujący kontakt, który aktualnie edytujemy (null = brak edycji)
     var contactToEdit by remember { mutableStateOf<TrustedContact?>(null) }
 
-    // Jeśli contactToEdit nie jest nullem, pokazujemy dialog
     if (contactToEdit != null) {
         EditContactDialog(
             contact = contactToEdit!!,
             onDismiss = { contactToEdit = null },
             onSave = { updatedContact ->
-                // Logika aktualizacji: znajdź indeks i podmień obiekt
                 val index = contacts.indexOfFirst { it.id == updatedContact.id }
                 if (index != -1) {
                     contacts[index] = updatedContact
+                    onContactListChanged() // ZAPIS po edycji
                 }
                 contactToEdit = null
             }
@@ -466,7 +644,6 @@ fun ContactsEditorView(
                 .fillMaxSize()
                 .padding(16.dp)
         ) {
-            // --- SEKCJA 1: Formularz dodawania ---
             Text("Dodaj nowy kontakt", style = MaterialTheme.typography.titleMedium)
             Spacer(modifier = Modifier.height(8.dp))
 
@@ -475,8 +652,7 @@ fun ContactsEditorView(
                 onValueChange = { newName = it },
                 label = { Text("Nazwa (np. Mama)") },
                 modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                leadingIcon = { Icon(Icons.Default.Person, contentDescription = null) }
+                singleLine = true
             )
             Spacer(modifier = Modifier.height(8.dp))
 
@@ -485,25 +661,22 @@ fun ContactsEditorView(
                 onValueChange = { newPhone = it },
                 label = { Text("Numer telefonu") },
                 modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                leadingIcon = { Icon(Icons.Default.Phone, contentDescription = null) }
+                singleLine = true
             )
             Spacer(modifier = Modifier.height(16.dp))
 
             Button(
                 onClick = {
                     if (newName.isNotBlank() && newPhone.isNotBlank()) {
-                        // Generowanie ID (w prawdziwej bazie robi to autoincrement)
                         val newId = (contacts.maxOfOrNull { it.id } ?: 0) + 1
                         contacts.add(TrustedContact(id = newId, name = newName, phone = newPhone))
+                        onContactListChanged() // ZAPIS po dodaniu
                         newName = ""
                         newPhone = ""
                     }
                 },
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Icon(Icons.Default.Add, contentDescription = null)
-                Spacer(modifier = Modifier.width(8.dp))
                 Text("Dodaj kontakt")
             }
 
@@ -511,7 +684,6 @@ fun ContactsEditorView(
             HorizontalDivider()
             Spacer(modifier = Modifier.height(16.dp))
 
-            // --- SEKCJA 2: Lista kontaktów ---
             Text("Twoja lista:", style = MaterialTheme.typography.titleMedium)
 
             LazyColumn {
@@ -521,21 +693,14 @@ fun ContactsEditorView(
                         supportingContent = { Text(contact.phone) },
                         trailingContent = {
                             Row {
-                                // Przycisk Edycji
                                 IconButton(onClick = { contactToEdit = contact }) {
-                                    Icon(
-                                        Icons.Default.Edit,
-                                        contentDescription = "Edytuj",
-                                        tint = MaterialTheme.colorScheme.primary
-                                    )
+                                    Icon(Icons.Default.Edit, contentDescription = "Edytuj", tint = MaterialTheme.colorScheme.primary)
                                 }
-                                // Przycisk Usuwania
-                                IconButton(onClick = { contacts.remove(contact) }) {
-                                    Icon(
-                                        Icons.Default.Delete,
-                                        contentDescription = "Usuń",
-                                        tint = MaterialTheme.colorScheme.error
-                                    )
+                                IconButton(onClick = {
+                                    contacts.remove(contact)
+                                    onContactListChanged() // ZAPIS po usunięciu
+                                }) {
+                                    Icon(Icons.Default.Delete, contentDescription = "Usuń", tint = MaterialTheme.colorScheme.error)
                                 }
                             }
                         }
