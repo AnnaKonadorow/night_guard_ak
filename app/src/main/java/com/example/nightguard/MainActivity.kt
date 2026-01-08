@@ -59,6 +59,8 @@ import org.osmdroid.bonuspack.location.GeocoderNominatim
 import kotlinx.coroutines.delay
 import android.content.Context
 import android.location.LocationManager
+import android.telephony.SmsManager
+import android.widget.Toast
 
 // Data class dla Kontaktu (na potrzeby edycji w pamięci)
 data class TrustedContact(val id: Int, val name: String, val phone: String)
@@ -102,6 +104,16 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+}
+
+fun sendSmsAlert(context: Context, phoneNumber: String, message: String) {
+    try {
+        val smsManager: SmsManager = context.getSystemService(SmsManager::class.java)
+        smsManager.sendTextMessage(phoneNumber, null, message, null, null)
+    } catch (e: Exception) {
+        Toast.makeText(context, "Błąd wysyłania do $phoneNumber: ${e.message}", Toast.LENGTH_SHORT).show()
+        e.printStackTrace()
     }
 }
 
@@ -293,7 +305,6 @@ fun HomeScreen(
         }
     }
 }
-
 @Composable
 fun TrustedContactItem(name: String, phone: String) {
     Card(
@@ -532,12 +543,13 @@ private fun setDestinationAndRoute(
 enum class ProfileView { MAIN, EDIT_CONTACTS }
 
 @OptIn(ExperimentalMaterial3Api::class)
+// --- ZMIANA W PROFILE SCREEN (dodaj parametr contacts) ---
 @Composable
 fun ProfileScreen(
     isDarkTheme: Boolean,
     onThemeChanged: (Boolean) -> Unit,
-    contacts: MutableList<TrustedContact>,
-    onContactListChanged: () -> Unit // Dodajemy ten parametr
+    contacts: List<TrustedContact>, // Zmienione na List dla odczytu
+    onContactListChanged: () -> Unit
 ) {
     var currentView by remember { mutableStateOf(ProfileView.MAIN) }
 
@@ -546,26 +558,46 @@ fun ProfileScreen(
             ProfileMainView(
                 isDarkTheme = isDarkTheme,
                 onThemeChanged = onThemeChanged,
-                onEditContactsClick = { currentView = ProfileView.EDIT_CONTACTS }
+                onEditContactsClick = { currentView = ProfileView.EDIT_CONTACTS },
+                contacts = contacts // Przekazujemy listę
             )
         }
         ProfileView.EDIT_CONTACTS -> {
             ContactsEditorView(
-                contacts = contacts,
+                contacts = contacts as MutableList<TrustedContact>,
                 onBack = { currentView = ProfileView.MAIN },
-                onContactListChanged = onContactListChanged // Przekazujemy dalej
+                onContactListChanged = onContactListChanged
             )
         }
     }
 }
 
+// --- ZMIANA W PROFILE MAIN VIEW ---
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileMainView(
     isDarkTheme: Boolean,
     onThemeChanged: (Boolean) -> Unit,
-    onEditContactsClick: () -> Unit
+    onEditContactsClick: () -> Unit,
+    contacts: List<TrustedContact> // Dodany parametr
 ) {
+    val context = LocalContext.current
+
+    // Launcher dla uprawnień SMS
+    val smsPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            // Jeśli przyznano po kliknięciu - wyślij do wszystkich
+            contacts.forEach { contact ->
+                sendSmsAlert(context, contact.phone, "To jest testowy alert z aplikacji NightGuard!")
+            }
+            Toast.makeText(context, "Wysłano testowe wiadomości", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(context, "Brak uprawnień do SMS", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     Scaffold(
         topBar = { CenterAlignedTopAppBar(title = { Text("Profil i Ustawienia") }) }
     ) { innerPadding ->
@@ -575,21 +607,17 @@ fun ProfileMainView(
                 .fillMaxSize()
                 .padding(16.dp)
         ) {
-            // Nagłówek użytkownika
+            // ... (reszta Twojego istniejącego kodu UI: Nagłówek, Motyw itp.) ...
+
+            // Nagłówek użytkownika (skrócony opis)
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 32.dp)) {
-                Box(
-                    modifier = Modifier
-                        .size(64.dp)
-                        .clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.primary),
-                    contentAlignment = Alignment.Center
-                ) {
+                Box(modifier = Modifier.size(64.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary), contentAlignment = Alignment.Center) {
                     Text("JA", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold)
                 }
                 Spacer(modifier = Modifier.width(16.dp))
                 Column {
                     Text("Jan Kowalski", style = MaterialTheme.typography.titleLarge)
-                    Text("jan.kowalski@student.pwr.edu.pl", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
+                    Text("jan.kowalski@student.pwr.edu.pl", color = Color.Gray)
                 }
             }
 
@@ -598,42 +626,47 @@ fun ProfileMainView(
 
             // Sekcja: Wygląd
             Text("Preferencje Aplikacji", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-
             ListItem(
                 headlineContent = { Text("Ciemny motyw") },
-                trailingContent = {
-                    Switch(checked = isDarkTheme, onCheckedChange = onThemeChanged)
-                }
-            )
-
-            ListItem(
-                headlineContent = { Text("Powiadomienia Push") },
-                supportingContent = { Text("Otrzymuj alerty o bezpieczeństwie") },
-                trailingContent = {
-                    var notificationsEnabled by remember { mutableStateOf(true) }
-                    Switch(checked = notificationsEnabled, onCheckedChange = { notificationsEnabled = it })
-                }
+                trailingContent = { Switch(checked = isDarkTheme, onCheckedChange = onThemeChanged) }
             )
 
             Spacer(modifier = Modifier.height(16.dp))
-            HorizontalDivider()
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Sekcja: Bezpieczeństwo
             Text("Bezpieczeństwo", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
 
             ListItem(
                 headlineContent = { Text("Zarządzaj Zaufanymi Kontaktami") },
-                supportingContent = { Text("Dodaj lub usuń osoby powiadamiane") },
                 leadingContent = { Icon(Icons.Default.Edit, contentDescription = null) },
                 modifier = Modifier.clickable { onEditContactsClick() }
             )
 
-            ListItem(
-                headlineContent = { Text("Czułość wykrywania trasy") },
-                supportingContent = { Text("Tolerancja zboczenia: 50m") },
-                leadingContent = { Icon(Icons.Default.Settings, contentDescription = null) }
-            )
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // --- TESTOWY PRZYCISK ---
+            Button(
+                onClick = {
+                    if (contacts.isEmpty()) {
+                        Toast.makeText(context, "Dodaj najpierw kontakty!", Toast.LENGTH_SHORT).show()
+                    } else {
+                        // Sprawdzanie uprawnień przed wysłaniem
+                        val permissionCheck = ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS)
+                        if (permissionCheck == PackageManager.PERMISSION_GRANTED) {
+                            contacts.forEach { contact ->
+                                sendSmsAlert(context, contact.phone, "Testowy alert z aplikacji NightGuard!")
+                            }
+                            Toast.makeText(context, "Wysłano test do ${contacts.size} osób", Toast.LENGTH_SHORT).show()
+                        } else {
+                            smsPermissionLauncher.launch(Manifest.permission.SEND_SMS)
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+            ) {
+                Icon(Icons.Default.Send, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Wyślij testowy SMS do wszystkich")
+            }
         }
     }
 }
