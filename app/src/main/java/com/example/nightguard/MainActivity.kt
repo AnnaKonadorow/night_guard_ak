@@ -61,14 +61,6 @@ import android.content.Context
 import android.location.LocationManager
 import android.telephony.SmsManager
 import android.widget.Toast
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.draw.rotate
-import org.osmdroid.bonuspack.routing.Road
-import org.osmdroid.bonuspack.routing.RoadNode
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.AccountCircle
-import androidx.compose.material.icons.filled.LocationOn
 
 // Data class dla Kontaktu (na potrzeby edycji w pamięci)
 data class TrustedContact(val id: Int, val name: String, val phone: String)
@@ -342,152 +334,155 @@ fun MapScreen() {
     // --- STANY ---
     var mapView by remember { mutableStateOf<MapView?>(null) }
     var locationOverlay by remember { mutableStateOf<MyLocationNewOverlay?>(null) }
-
-    var startPoint by remember { mutableStateOf<GeoPoint?>(null) }
-    var destinationPoint by remember { mutableStateOf<GeoPoint?>(null) }
-    var currentRoad by remember { mutableStateOf<Road?>(null) }
-
-    var destinationQuery by remember { mutableStateOf("") }
+    var searchQuery by remember { mutableStateOf("") }
     var suggestions by remember { mutableStateOf<List<android.location.Address>>(emptyList()) }
-    var isExpanded by remember { mutableStateOf(false) } // Rozwijanie listy kroków
 
-    // --- GEOLOKALIZACJA ---
-    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-        if (it[Manifest.permission.ACCESS_FINE_LOCATION] == true) {
-            locationOverlay?.enableMyLocation()
-        }
+    // Sprawdzanie uprawnień (ważne po czyszczeniu danych)
+    var hasLocationPermission by remember {
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED)
     }
 
-    LaunchedEffect(Unit) {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
-        }
+    // --- LOGIKA UPRAWNIEŃ ---
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        hasLocationPermission = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
     }
 
-    // --- WYSZUKIWANIE ---
-    LaunchedEffect(destinationQuery) {
-        if (destinationQuery.length > 3) {
+    // --- INTELIGENTNE WYSZUKIWANIE (DEBOUNCE 600ms) ---
+    LaunchedEffect(searchQuery) {
+        if (searchQuery.length > 3) {
             delay(600)
-            val geocoder = GeocoderNominatim("NightGuard/0.1.3")
+            val geocoder = GeocoderNominatim("NightGuard/1.0")
             try {
-                val results = withContext(Dispatchers.IO) { geocoder.getFromLocationName(destinationQuery, 5) }
+                val results = withContext(Dispatchers.IO) {
+                    geocoder.getFromLocationName(searchQuery, 10)
+                }
                 suggestions = results ?: emptyList()
-            } catch (e: Exception) { suggestions = emptyList() }
-        } else suggestions = emptyList()
+            } catch (e: Exception) {
+                suggestions = emptyList()
+            }
+        } else {
+            suggestions = emptyList()
+        }
     }
 
+    // --- REAKCJA NA ZMIANĘ STANU UPRAWNIEŃ ---
+    LaunchedEffect(hasLocationPermission) {
+        if (hasLocationPermission) {
+            locationOverlay?.enableMyLocation()
+            locationOverlay?.enableFollowLocation()
+            mapView?.invalidate()
+        } else {
+            permissionLauncher.launch(arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            ))
+        }
+    }
+
+    // --- UKŁAD UI ---
     Box(modifier = Modifier.fillMaxSize()) {
-        // 1. MAPA
+
+        // 1. MAPA (Warstwa spodnia)
         AndroidView(
             factory = { ctx ->
+                // Ładowanie konfiguracji osmdroid
                 Configuration.getInstance().load(ctx, ctx.getSharedPreferences("osmdroid", Context.MODE_PRIVATE))
+
                 MapView(ctx).apply {
                     setTileSource(TileSourceFactory.MAPNIK)
                     setMultiTouchControls(true)
                     controller.setZoom(15.0)
 
-                    val overlay = MyLocationNewOverlay(GpsMyLocationProvider(ctx), this)
-                    overlay.enableMyLocation()
+                    val provider = GpsMyLocationProvider(ctx).apply {
+                        addLocationSource(LocationManager.GPS_PROVIDER)
+                        addLocationSource(LocationManager.NETWORK_PROVIDER)
+                    }
+
+                    val overlay = MyLocationNewOverlay(provider, this)
+                    if (hasLocationPermission) {
+                        overlay.enableMyLocation()
+                    }
+
                     overlays.add(overlay)
                     locationOverlay = overlay
 
-                    // Kliknięcie w mapę ustawia CEL (Punkt B)
-                    overlays.add(MapEventsOverlay(object : MapEventsReceiver {
+                    // Obsługa kliknięcia w mapę (ustawianie pinezki ręcznie)
+                    val mapEventsReceiver = object : MapEventsReceiver {
                         override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {
-                            p?.let {
-                                destinationPoint = it
-                                startPoint = locationOverlay?.myLocation
-                                if (startPoint != null) {
-                                    fetchRoute(context, this@apply, startPoint!!, it) { road -> currentRoad = road }
-                                }
+                            p?.let { target ->
+                                setDestinationAndRoute(target, this@apply, locationOverlay, ctx)
                             }
                             return true
                         }
                         override fun longPressHelper(p: GeoPoint?): Boolean = false
-                    }))
+                    }
+                    overlays.add(MapEventsOverlay(mapEventsReceiver))
+
                     mapView = this
                 }
             },
             modifier = Modifier.fillMaxSize()
         )
 
-        // 2. PANEL ROUTINGU (Wzorowany na OSRM Demo)
+        // 2. PASEK WYSZUKIWANIA I PODPOWIEDZI (Warstwa środkowa, na górze)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(top = 50.dp, start = 16.dp, end = 16.dp)
+                .padding(top = 48.dp, start = 16.dp, end = 16.dp)
                 .align(Alignment.TopCenter)
         ) {
-            Card(elevation = CardDefaults.cardElevation(8.dp)) {
-                Column(modifier = Modifier.padding(8.dp)) {
-                    // Start (Punkt A) - Domyślnie Twoja lokalizacja
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.AccountCircle, contentDescription = null, tint = Color.Blue, modifier = Modifier.size(12.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text("Moja lokalizacja", style = MaterialTheme.typography.bodyMedium)
-                    }
-
-                    HorizontalDivider(Modifier.padding(vertical = 8.dp), thickness = 1.dp)
-
-                    // Cel (Punkt B)
-                    TextField(
-                        value = destinationQuery,
-                        onValueChange = { destinationQuery = it },
-                        placeholder = { Text("Wyszukaj cel...") },
-                        modifier = Modifier.fillMaxWidth(),
-                        leadingIcon = { Icon(Icons.Default.LocationOn, contentDescription = null, tint = Color.Red) },
-                        trailingIcon = {
-                            if (currentRoad != null) {
-                                IconButton(onClick = {
-                                    currentRoad = null
-                                    destinationQuery = ""
-                                    mapView?.overlays?.removeAll { it is Polyline || it is Marker }
-                                    mapView?.invalidate()
-                                }) { Icon(Icons.Default.Close, null) }
+            Card(
+                elevation = CardDefaults.cardElevation(8.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+            ) {
+                TextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    placeholder = { Text("Wyszukaj adres docelowy...") },
+                    modifier = Modifier.fillMaxWidth(),
+                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { searchQuery = ""; suggestions = emptyList() }) {
+                                Icon(Icons.Default.Clear, contentDescription = null)
                             }
-                        },
-                        colors = TextFieldDefaults.colors(focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent),
-                        singleLine = true
+                        }
+                    },
+                    singleLine = true,
+                    colors = TextFieldDefaults.colors(
+                        focusedIndicatorColor = Color.Transparent,
+                        unfocusedIndicatorColor = Color.Transparent
                     )
-                }
+                )
             }
 
-            // Sugestie wyszukiwania
+            // Lista podpowiedzi
             if (suggestions.isNotEmpty()) {
-                Card(modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {
-                    LazyColumn(modifier = Modifier.heightIn(max = 200.dp)) {
-                        items(suggestions) { addr ->
-                            // Budujemy pełny opis: Ulica Numer, Miasto (Województwo)
-                            val street = addr.thoroughfare ?: ""
-                            val houseNum = addr.featureName ?: "" // W OSM featureName często trzyma numer budynku
-                            val city = addr.locality ?: addr.adminArea ?: ""
-                            val country = addr.countryName ?: ""
-
-                            // Tworzymy czytelną etykietę
-                            val mainText = if (street.isNotEmpty()) "$street $houseNum".trim() else addr.featureName ?: "Nieznany punkt"
-                            val secondaryText = "$city, $country".trim().trim(',')
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    elevation = CardDefaults.cardElevation(4.dp)
+                ) {
+                    LazyColumn(modifier = Modifier.heightIn(max = 250.dp)) {
+                        items(suggestions) { address ->
+                            val street = address.thoroughfare ?: ""
+                            val houseNum = address.featureName ?: ""
+                            val city = address.locality ?: address.adminArea ?: ""
+                            val label = if (street.isNotEmpty()) "$street $houseNum, $city".trim() else address.getAddressLine(0)
 
                             ListItem(
-                                headlineContent = { Text(mainText, fontWeight = FontWeight.Bold) },
-                                supportingContent = { Text(secondaryText, style = MaterialTheme.typography.bodySmall) },
-                                leadingContent = { Icon(Icons.Default.LocationOn, contentDescription = null, tint = Color.Gray) },
+                                headlineContent = { Text(label) },
+                                supportingContent = { Text(address.adminArea ?: "") },
                                 modifier = Modifier.clickable {
-                                    val point = GeoPoint(addr.latitude, addr.longitude)
-                                    destinationPoint = point
-                                    startPoint = locationOverlay?.myLocation
-
-                                    // Ustawiamy w polu tekstowym pełny adres po kliknięciu
-                                    destinationQuery = "$mainText, $city"
-                                    suggestions = emptyList() // Zamykamy listę sugestii
-
-                                    if (startPoint != null) {
-                                        fetchRoute(context, mapView!!, startPoint!!, point) { road ->
-                                            currentRoad = road
-                                        }
-                                    } else {
-                                        // Jeśli nie mamy GPS, tylko przesuń mapę do celu
-                                        mapView?.controller?.animateTo(point)
+                                    val target = GeoPoint(address.latitude, address.longitude)
+                                    mapView?.let { mv ->
+                                        mv.controller.animateTo(target)
+                                        setDestinationAndRoute(target, mv, locationOverlay, context)
                                     }
+                                    searchQuery = label
+                                    suggestions = emptyList()
                                 }
                             )
                             HorizontalDivider(thickness = 0.5.dp)
@@ -495,55 +490,26 @@ fun MapScreen() {
                     }
                 }
             }
-
-            // LISTA KROKÓW (Turn-by-turn instructions)
-            if (currentRoad != null) {
-                Spacer(Modifier.height(8.dp))
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    onClick = { isExpanded = !isExpanded }
-                ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.ArrowForward, null, modifier = Modifier.rotate(-90f))
-                            Spacer(Modifier.width(8.dp))
-                            Text(
-                                text = "Trasa: ${String.format("%.2f", currentRoad!!.mLength)} km • ${currentRoad!!.mDuration.toInt() / 60} min",
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                        if (isExpanded) {
-                            HorizontalDivider(Modifier.padding(vertical = 8.dp))
-                            LazyColumn(modifier = Modifier.heightIn(max = 300.dp)) {
-                                items(currentRoad!!.mNodes) { node ->
-                                    if (node.mInstructions != null) {
-                                        ListItem(
-                                            headlineContent = { Text(node.mInstructions) },
-                                            leadingContent = { Icon(Icons.Default.ArrowForward, null, modifier = Modifier.size(16.dp)) },
-                                            supportingContent = { Text("${(node.mLength * 1000).toInt()} m") }
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
         }
 
-        // 3. PRZYCISK LOKALIZACJI
+        // 3. PRZYCISK LOKALIZACJI (Warstwa wierzchnia, prawy dół)
         FloatingActionButton(
             onClick = {
-                locationOverlay?.let {
-                    it.enableFollowLocation()
-                    it.myLocation?.let { loc -> mapView?.controller?.animateTo(loc) }
+                if (hasLocationPermission) {
+                    locationOverlay?.let {
+                        it.enableFollowLocation()
+                        it.myLocation?.let { loc -> mapView?.controller?.animateTo(loc) }
+                    }
+                } else {
+                    permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
                 }
             },
-            modifier = Modifier.align(Alignment.BottomEnd).padding(32.dp),
-            containerColor = MaterialTheme.colorScheme.surface
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(bottom = 32.dp, end = 16.dp),
+            containerColor = MaterialTheme.colorScheme.primary
         ) {
-            // Zmieniono z Icons.Default.MyLocation na Icons.Default.LocationOn
-            Icon(Icons.Default.LocationOn, contentDescription = "Moja lokalizacja")
+            Icon(Icons.Default.LocationOn, contentDescription = "Lokalizacja")
         }
     }
 }
@@ -864,32 +830,4 @@ fun EditContactDialog(
             }
         }
     )
-}
-
-fun fetchRoute(context: Context, mapView: MapView, start: GeoPoint, dest: GeoPoint, onLoaded: (Road) -> Unit) {
-    val roadManager = OSRMRoadManager(context, "NightGuard/0.1.3")
-    roadManager.setService("https://router.project-osrm.org/route/v1/walking/")
-
-    GlobalScope.launch(Dispatchers.IO) {
-        val road = roadManager.getRoad(arrayListOf(start, dest))
-        withContext(Dispatchers.Main) {
-            if (road.mStatus == Road.STATUS_OK) {
-                // Czyścimy stare trasy i markery
-                mapView.overlays.removeAll { it is Polyline || it is Marker }
-
-                // Rysujemy trasę
-                val roadOverlay = RoadManager.buildRoadOverlay(road)
-                mapView.overlays.add(roadOverlay)
-
-                // Dodajemy Marker startu i końca
-                val startMarker = Marker(mapView).apply { position = start; title = "Start" }
-                val destMarker = Marker(mapView).apply { position = dest; title = "Cel" }
-                mapView.overlays.add(startMarker)
-                mapView.overlays.add(destMarker)
-
-                mapView.invalidate()
-                onLoaded(road)
-            }
-        }
-    }
 }
