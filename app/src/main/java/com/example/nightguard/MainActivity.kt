@@ -67,7 +67,7 @@ import android.net.Uri
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.ui.layout.ModifierLocalBeyondBoundsLayout
 
-
+//Testowa zmiana
 // Data class dla Kontaktu (na potrzeby edycji w pamięci)
 data class TrustedContact(val id: Int, val name: String, val phone: String)
 
