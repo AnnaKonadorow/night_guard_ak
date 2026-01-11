@@ -681,7 +681,6 @@ fun ProfileMainView(
                 Spacer(modifier = Modifier.width(16.dp))
                 Column {
                     Text("Jan Kowalski", style = MaterialTheme.typography.titleLarge)
-                    Text("jan.kowalski@student.pwr.edu.pl", color = Color.Gray)
                 }
             }
 
