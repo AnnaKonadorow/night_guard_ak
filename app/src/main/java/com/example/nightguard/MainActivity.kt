@@ -61,13 +61,7 @@ import android.content.Context
 import android.location.LocationManager
 import android.telephony.SmsManager
 import android.widget.Toast
-import android.content.Intent
-import android.location.Address
-import android.net.Uri
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.ui.layout.ModifierLocalBeyondBoundsLayout
 
-//Testowa zmiana
 // Data class dla Kontaktu (na potrzeby edycji w pamięci)
 data class TrustedContact(val id: Int, val name: String, val phone: String)
 
@@ -166,28 +160,21 @@ fun NightGuardApp(
         when (currentDestination) {
             AppDestinations.HOME -> HomeScreen(
                 onNavigateToMap = { currentDestination = AppDestinations.MAP },
-                contacts = trustedContacts,
-                onContactUpdated = { updatedContact ->
-                    val index = trustedContacts.indexOfFirst { it.id == updatedContact.id }
-                    if (index != -1) {
-                        trustedContacts[index] = updatedContact
-                        syncContacts() // Wywołanie zapisu do DataStore
-                    }
-                }
+                contacts = trustedContacts
             )
             AppDestinations.MAP -> MapScreen()
             AppDestinations.PROFILE -> ProfileScreen(
                 isDarkTheme = isDarkTheme,
                 onThemeChanged = onThemeChanged,
                 contacts = trustedContacts,
-                onContactListChanged = {syncContacts()}
+                onContactListChanged = { syncContacts() } // Zapisuj przy każdej zmianie
             )
         }
     }
 }
 
 fun traceRoute(
-    context: Context,
+    context: android.content.Context,
     mapView: MapView,
     startPoint: GeoPoint,
     destinationPoint: GeoPoint
@@ -245,7 +232,7 @@ fun findAddress(
 }
 fun fetchAddressSuggestions(
     query: String,
-    onResult: (List<Address>) -> Unit
+    onResult: (List<android.location.Address>) -> Unit
 ) {
     if (query.length < 3) return // Nie szukaj dla zbyt krótkich fraz
 
@@ -273,25 +260,8 @@ enum class AppDestinations(val label: String, val icon: ImageVector) {
 @Composable
 fun HomeScreen(
     onNavigateToMap: () -> Unit,
-    contacts: List<TrustedContact>,
-    onContactUpdated: (TrustedContact) -> Unit // Nowy parametr
+    contacts: List<TrustedContact>
 ) {
-    val context = LocalContext.current
-    // Stan przechowujący kontakt, który aktualnie edytujemy
-    var contactToEdit by remember { mutableStateOf<TrustedContact?>(null) }
-
-    // Wyświetlanie dialogu edycji (używamy Twojej istniejącej klasy EditContactDialog)
-    if (contactToEdit != null) {
-        EditContactDialog(
-            contact = contactToEdit!!,
-            onDismiss = { contactToEdit = null },
-            onSave = { updated ->
-                onContactUpdated(updated)
-                contactToEdit = null
-            }
-        )
-    }
-
     Scaffold(
         topBar = { CenterAlignedTopAppBar(title = { Text("Asystent Powrotu") }) }
     ) { innerPadding ->
@@ -302,11 +272,15 @@ fun HomeScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Karta nawigacji (bez zmian)
+            // Karta nawigacji
             ElevatedCard(
                 onClick = onNavigateToMap,
-                modifier = Modifier.fillMaxWidth().height(120.dp),
-                colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(120.dp),
+                colors = CardDefaults.elevatedCardColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                )
             ) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -324,23 +298,7 @@ fun HomeScreen(
             } else {
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(contacts) { contact ->
-                        TrustedContactItem(
-                            name = contact.name,
-                            phone = contact.phone,
-                            onEditClick = { contactToEdit = contact }, // Ustawiamy kontakt do edycji
-                            onCallClick = {
-                                val intent = Intent(Intent.ACTION_DIAL).apply {
-                                    data = Uri.parse("tel:${contact.phone}")
-                                }
-                                context.startActivity(intent)
-                            },
-                            onSmsClick = {
-                                val intent = Intent(Intent.ACTION_SENDTO).apply {
-                                    data = Uri.parse("smsto:${contact.phone}")
-                                }
-                                context.startActivity(intent)
-                            }
-                        )
+                        TrustedContactItem(name = contact.name, phone = contact.phone)
                     }
                 }
             }
@@ -348,42 +306,20 @@ fun HomeScreen(
     }
 }
 @Composable
-fun TrustedContactItem(
-    name: String,
-    phone: String,
-    onSmsClick: () -> Unit,
-    onCallClick: () -> Unit,
-    onEditClick: () -> Unit
-) {
+fun TrustedContactItem(name: String, phone: String) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Row(
-            modifier = Modifier.padding(16.dp).fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp) // Zmniejszyłem odstęp między ikonami
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(Icons.Default.Person, contentDescription = null)
-
-            Column(modifier = Modifier.weight(1f).padding(start = 8.dp)) {
+            Spacer(modifier = Modifier.width(16.dp))
+            Column {
                 Text(text = name, fontWeight = FontWeight.Bold)
                 Text(text = phone, style = MaterialTheme.typography.bodySmall)
-            }
-
-            // Przycisk Edycji
-            IconButton(onClick = onEditClick) {
-                Icon(Icons.Default.Edit, contentDescription = "Edytuj", tint = MaterialTheme.colorScheme.outline)
-            }
-
-            // Przycisk SMS
-            IconButton(onClick = onSmsClick) {
-                Icon(Icons.Default.Email, contentDescription = "SMS", tint = MaterialTheme.colorScheme.primary)
-            }
-
-            // Przycisk Telefonu
-            IconButton(onClick = onCallClick) {
-                Icon(Icons.Default.Phone, contentDescription = "Zadzwoń", tint = MaterialTheme.colorScheme.primary)
             }
         }
     }
@@ -399,7 +335,7 @@ fun MapScreen() {
     var mapView by remember { mutableStateOf<MapView?>(null) }
     var locationOverlay by remember { mutableStateOf<MyLocationNewOverlay?>(null) }
     var searchQuery by remember { mutableStateOf("") }
-    var suggestions by remember { mutableStateOf<List<Address>>(emptyList()) }
+    var suggestions by remember { mutableStateOf<List<android.location.Address>>(emptyList()) }
 
     // Sprawdzanie uprawnień (ważne po czyszczeniu danych)
     var hasLocationPermission by remember {
@@ -582,7 +518,7 @@ private fun setDestinationAndRoute(
     target: GeoPoint,
     mapView: MapView,
     locationOverlay: MyLocationNewOverlay?,
-    context: Context
+    context: android.content.Context
 ) {
     // Usuń stare markery i trasy
     mapView.overlays.removeAll { it is Marker || it is Polyline }
